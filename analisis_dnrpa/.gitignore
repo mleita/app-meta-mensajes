@@ -1,0 +1,6 @@
+# CSV crudos de DNRPA (pesados; se re-descargan con el script)
+data/raw/*.csv
+data/raw/*.zip
+data/raw/*.part
+data/procesado/
+__pycache__/
