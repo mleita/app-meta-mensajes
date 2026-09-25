@@ -8,7 +8,7 @@ Fuente única: DNRPA / Ministerio de Justicia, dataset "Transferencias de autos"
 
 Indicador por mes:
   transferencias_totales        = filas con registro_seccional_provincia == CORDOBA
-  transferencias_habitualistas  = ídem y tramite_tipo == "TRANSFERENCIA A COMERCIANTE HABITUALISTA"
+  transferencias_habitualistas  = ídem y tramite_tipo "A COM. HAB." (cualquier variante: F17, C/PEDIDO…)
   porcentaje_habitualistas      = habitualistas / totales * 100
 
 Uso:
@@ -39,7 +39,11 @@ RAW = BASE / "data" / "raw"
 OUT = BASE / "output"
 
 CKAN_API = "https://datos.jus.gob.ar/api/3/action/package_show?id=transferencias-de-autos"
-TIPO_HABITUALISTA = "TRANSFERENCIA A COMERCIANTE HABITUALISTA"
+# El dataset real abrevia: "TRANSFERENCIA NACIONAL A COM. HAB. F17", "... IMPORTADO A COM. HAB  C/PEDIDO.", etc.
+# "A COM. HAB." = compra un comerciante habitualista (numerador); "DE COM. HAB." = vende (no se suma).
+# Se compara sobre norm(), que colapsa espacios. También acepta la forma larga "A COMERCIANTE HABITUALISTA".
+PATRON_HABITUALISTA = re.compile(r"\bA (COM\.? ?HAB\b|COMERCIANTE HABITUALISTA\b)")
+PATRON_COMERCIANTE = re.compile(r"\bCOM\.? ?HAB\b|HABITUALISTA")
 PROVINCIA_OBJETIVO = "CORDOBA"  # comparado tras normalizar (mayúsculas, sin tildes, sin espacios extra)
 
 # Sanity check externo aportado por el usuario (NO es fuente; sólo comparación).
@@ -58,6 +62,10 @@ def norm(s) -> str:
         return ""
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
     return re.sub(r"\s+", " ", s).strip().upper()
+
+
+def es_tipo_habitualista(tipo) -> bool:
+    return bool(PATRON_HABITUALISTA.search(norm(tipo)))
 
 
 # --------------------------------------------------------------------------- descarga
@@ -167,50 +175,73 @@ def mes_de_archivo(nombre: str):
     return (int(m.group(1)), int(m.group(2))) if m and m.group(2) else None
 
 
+def elegir_csvs(archivos: list[Path]):
+    """Un mismo CSV mensual puede venir suelto y dentro del ZIP anual: se lee una sola vez.
+    Si difieren, gana el CSV suelto (es la publicación individual del mes)."""
+    elegidos, omitidos = {}, []
+    for p in archivos:
+        suelto = p.suffix.lower() != ".zip"
+        for nombre, contenido in abrir_bytes(p):
+            clave = Path(nombre).name.lower()
+            previo = elegidos.get(clave)
+            if previo is None or (suelto and not previo[2]):
+                if previo is not None:
+                    omitidos.append({"archivo": clave, "omitido_de": previo[0], "usado_de": p.name,
+                                     "identico": previo[3] == contenido})
+                elegidos[clave] = (p.name, Path(nombre).name, suelto, contenido)
+            else:
+                omitidos.append({"archivo": clave, "omitido_de": p.name, "usado_de": previo[0],
+                                 "identico": previo[3] == contenido})
+    return [(v[1], v[3]) for _, v in sorted(elegidos.items())], omitidos
+
+
 def procesar_archivos(archivos: list[Path]):
     inspeccion, cordoba_partes = [], []
     tipos_pais = {}
     provincias_crudas = {}
-    for p in archivos:
-        for nombre, contenido in abrir_bytes(p):
-            fmt = detectar_formato(contenido)
-            df = pd.read_csv(io.BytesIO(contenido), sep=fmt["separador"], encoding=fmt["encoding"],
-                             dtype=str, keep_default_na=True)
-            df.columns = [c.strip() for c in df.columns]
-            faltan = [c for c in ("tramite_fecha", "tramite_tipo", "registro_seccional_provincia")
-                      if c not in df.columns]
-            if faltan:
-                raise SystemExit(f"{nombre}: faltan columnas {faltan}. Columnas: {list(df.columns)}")
+    csvs, omitidos = elegir_csvs(archivos)
+    for o in omitidos:
+        print(f"  {o['archivo']}: repetido en {o['omitido_de']} "
+              f"({'idéntico' if o['identico'] else 'DISTINTO'}); se usa el de {o['usado_de']}")
+    for nombre, contenido in csvs:
+        fmt = detectar_formato(contenido)
+        df = pd.read_csv(io.BytesIO(contenido), sep=fmt["separador"], encoding=fmt["encoding"],
+                         dtype=str, keep_default_na=True)
+        df.columns = [c.strip() for c in df.columns]
+        faltan = [c for c in ("tramite_fecha", "tramite_tipo", "registro_seccional_provincia")
+                  if c not in df.columns]
+        if faltan:
+            raise SystemExit(f"{nombre}: faltan columnas {faltan}. Columnas: {list(df.columns)}")
 
-            for v, n in df["registro_seccional_provincia"].value_counts(dropna=False).items():
-                provincias_crudas[v] = provincias_crudas.get(v, 0) + int(n)
-            for v, n in df["tramite_tipo"].value_counts(dropna=False).items():
-                tipos_pais[v] = tipos_pais.get(v, 0) + int(n)
+        for v, n in df["registro_seccional_provincia"].value_counts(dropna=False).items():
+            provincias_crudas[v] = provincias_crudas.get(v, 0) + int(n)
+        for v, n in df["tramite_tipo"].value_counts(dropna=False).items():
+            tipos_pais[v] = tipos_pais.get(v, 0) + int(n)
 
-            es_cba = df["registro_seccional_provincia"].map(norm) == PROVINCIA_OBJETIVO
-            cba = df[es_cba].copy()
-            cba["archivo_origen"] = nombre
-            fam = mes_de_archivo(nombre)
-            cba["archivo_anio"], cba["archivo_mes"] = (fam if fam else (None, None))
-            cordoba_partes.append(cba)
+        es_cba = df["registro_seccional_provincia"].map(norm) == PROVINCIA_OBJETIVO
+        cba = df[es_cba].copy()
+        cba["archivo_origen"] = nombre
+        fam = mes_de_archivo(nombre)
+        cba["archivo_anio"], cba["archivo_mes"] = (fam if fam else (None, None))
+        cordoba_partes.append(cba)
 
-            fechas = parsear_fecha(df["tramite_fecha"])
-            inspeccion.append({
-                "archivo": nombre,
-                "bytes": len(contenido),
-                "encoding": fmt["encoding"],
-                "separador": fmt["separador"],
-                "filas_pais": len(df),
-                "filas_cordoba": int(es_cba.sum()),
-                "columnas": list(df.columns),
-                "formato_tramite_fecha": formato_fecha(df["tramite_fecha"]),
-                "tramite_fecha_min": str(fechas.min().date()) if fechas.notna().any() else None,
-                "tramite_fecha_max": str(fechas.max().date()) if fechas.notna().any() else None,
-                "tramite_fecha_no_parseable": int((fechas.isna() & df["tramite_fecha"].notna()).sum()),
-            })
-            print(f"  {nombre}: {len(df):,} filas país, {int(es_cba.sum()):,} Córdoba")
+        fechas = parsear_fecha(df["tramite_fecha"])
+        inspeccion.append({
+            "archivo": nombre,
+            "bytes": len(contenido),
+            "encoding": fmt["encoding"],
+            "separador": fmt["separador"],
+            "filas_pais": len(df),
+            "filas_cordoba": int(es_cba.sum()),
+            "columnas": list(df.columns),
+            "formato_tramite_fecha": formato_fecha(df["tramite_fecha"]),
+            "tramite_fecha_min": str(fechas.min().date()) if fechas.notna().any() else None,
+            "tramite_fecha_max": str(fechas.max().date()) if fechas.notna().any() else None,
+            "tramite_fecha_no_parseable": int((fechas.isna() & df["tramite_fecha"].notna()).sum()),
+        })
+        print(f"  {nombre}: {len(df):,} filas país, {int(es_cba.sum()):,} Córdoba")
     cordoba = pd.concat(cordoba_partes, ignore_index=True) if cordoba_partes else pd.DataFrame()
-    return cordoba, inspeccion, tipos_pais, provincias_crudas
+    return cordoba, inspeccion, tipos_pais, provincias_crudas, omitidos
 
 
 # --------------------------------------------------------------------------- cálculo
@@ -240,7 +271,9 @@ def calcular(cba: pd.DataFrame, desde: tuple, hasta: tuple, eliminar_duplicados:
 
     tipos = cba["tramite_tipo"].fillna("<NULO>").value_counts()
     control["tramite_tipo_cordoba"] = {k: int(v) for k, v in tipos.items()}
-    control["tipos_con_HABITUALISTA"] = {k: int(v) for k, v in tipos.items() if "HABITUALISTA" in norm(k)}
+    control["tipos_comerciante_habitualista"] = {k: int(v) for k, v in tipos.items()
+                                                 if PATRON_COMERCIANTE.search(norm(k))}
+    control["tipos_numerador"] = {k: int(v) for k, v in tipos.items() if es_tipo_habitualista(k)}
     control["tipos_sospechosos_anulacion_rectificacion"] = {
         k: int(v) for k, v in tipos.items() if any(w in norm(k) for w in PALABRAS_SOSPECHOSAS)}
 
@@ -253,7 +286,7 @@ def calcular(cba: pd.DataFrame, desde: tuple, hasta: tuple, eliminar_duplicados:
     periodo = cba[(cba["anio"] * 100 + cba["mes"] >= desde[0] * 100 + desde[1]) &
                   (cba["anio"] * 100 + cba["mes"] <= hasta[0] * 100 + hasta[1])].copy()
     control["filas_fuera_de_periodo_descartadas"] = int(len(cba) - len(periodo))
-    periodo["es_habitualista"] = periodo["tramite_tipo"].map(lambda x: str(x).strip()) == TIPO_HABITUALISTA
+    periodo["es_habitualista"] = periodo["tramite_tipo"].map(es_tipo_habitualista).astype(bool)
 
     # numerador ⊆ denominador: por construcción ambos salen del mismo DataFrame filtrado
     num = periodo[periodo["es_habitualista"]]
@@ -370,8 +403,9 @@ METODOLOGIA = [
                           "domicilio del primer titular o guarda habitual."),
     ("Mes", "Año y mes de tramite_fecha (fecha en que se perfecciona el trámite)."),
     ("Denominador", "Todas las filas de Córdoba del mes, cualquiera sea el tramite_tipo."),
-    ("Numerador", f"Filas de Córdoba del mes con tramite_tipo exactamente '{TIPO_HABITUALISTA}'. Otros tipos que "
-                  "contengan 'HABITUALISTA' se informan en la hoja de control y NO se suman."),
+    ("Numerador", "Filas de Córdoba del mes cuyo tramite_tipo es una transferencia 'A COM. HAB.' (a comerciante "
+                  "habitualista), en todas sus variantes: NACIONAL/IMPORTADO, F17, C/PEDIDO. Los tipos 'DE COM. "
+                  "HAB.' (vende el comerciante) se informan en la hoja de control y NO se suman."),
     ("% captado", "numerador / denominador * 100, por mes. El % acumulado de cada período es "
                   "Σ habitualistas / Σ totales (no el promedio de porcentajes)."),
     ("Qué significa", "Qué proporción de las transferencias inscriptas en Córdoba tuvo como adquirente a un "
@@ -545,10 +579,11 @@ def main():
     man_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), "utf-8")
 
     print("Leyendo archivos…")
-    cba, inspeccion, tipos_pais, provincias = procesar_archivos(archivos)
+    cba, inspeccion, tipos_pais, provincias, omitidos = procesar_archivos(archivos)
     cba.to_csv(proc / "transferencias_cordoba_filas.csv.gz", index=False, compression="gzip")
 
     mensual, control, _ = calcular(cba, args.desde, args.hasta, args.eliminar_duplicados)
+    control["csv_repetidos_omitidos"] = omitidos
     fecha_max = max((i["tramite_fecha_max"] for i in inspeccion if i["tramite_fecha_max"]), default=None)
     control["fecha_max_tramite_fecha"] = fecha_max
     ultimo = mensual.iloc[-1]

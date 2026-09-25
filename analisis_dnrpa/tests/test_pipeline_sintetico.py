@@ -6,11 +6,14 @@ import json
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
 
 SCRIPT = Path(__file__).resolve().parents[1] / "dnrpa_habitualistas_cordoba.py"
+TIPOS_A_HAB = ["TRANSFERENCIA NACIONAL A COM. HAB. F17", "TRANSFERENCIA IMPORTADO A COM. HAB  C/PEDIDO.",
+               "TRANSFERENCIA A COMERCIANTE HABITUALISTA"]
 COLS = ["tramite_tipo", "tramite_fecha", "fecha_inscripcion_inicial", "registro_seccional_codigo",
         "registro_seccional_descripcion", "registro_seccional_provincia", "automotor_origen",
         "automotor_anio_modelo", "automotor_marca_descripcion", "automotor_modelo_descripcion"]
@@ -33,17 +36,21 @@ def main():
         for k in range(tot - hab):
             i += 1
             filas.append(fila("TRANSFERENCIA NACIONAL", f, "Córdoba" if k % 2 else "CORDOBA ", i))
-        for _ in range(hab):
+        for tipo in TIPOS_A_HAB[:hab]:  # variantes reales abreviadas: todas al numerador
             i += 1
-            filas.append(fila("TRANSFERENCIA A COMERCIANTE HABITUALISTA", f, "CORDOBA", i))
+            filas.append(fila(tipo, f, "CORDOBA", i))
         i += 1
-        filas.append(fila("TRANSFERENCIA A COMERCIANTE HABITUALISTA", f, "SANTA FE", i))  # otra provincia
+        filas.append(fila("TRANSFERENCIA NACIONAL A COM. HAB. F17", f, "SANTA FE", i))  # otra provincia
         i += 1
-        filas.append(fila("TRANSFERENCIA DE HABITUALISTA X", f, "CORDOBA", i))  # otro tipo: sí en total
+        filas.append(fila("TRANSFERENCIA NACIONAL  DE COM. HAB. C/PEDIDO", f, "CORDOBA", i))  # vende: sí en total
         filas.append(filas[0])  # duplicado exacto: se informa, no se elimina por defecto
         esperado[(anio, mes)] = (tot + 2, hab)
         pd.DataFrame(filas, columns=COLS).to_csv(raw / f"dnrpa-transferencias-autos-{anio}{mes:02d}.csv",
                                                   index=False)
+
+    # el último mes también viene dentro del ZIP anual (como publica DNRPA): no debe contarse dos veces
+    with zipfile.ZipFile(raw / "dnrpa-transferencias-autos-2026.zip", "w") as z:
+        z.write(raw / "dnrpa-transferencias-autos-202601.csv", "dnrpa-transferencias-autos-202601.csv")
 
     subprocess.run([sys.executable, str(SCRIPT), "--solo-local", "--raw-dir", str(raw), "--out-dir", str(out)],
                    check=True)
@@ -54,8 +61,11 @@ def main():
         assert (r.transferencias_totales, r.transferencias_habitualistas) == esperado[(r.anio, r.mes)], r
     ctrl = json.loads((out / "control_calidad.json").read_text())["control"]
     assert ctrl["filas_duplicadas_exactas"] == 3
-    assert set(ctrl["tipos_con_HABITUALISTA"]) == {"TRANSFERENCIA A COMERCIANTE HABITUALISTA",
-                                                  "TRANSFERENCIA DE HABITUALISTA X"}
+    assert set(ctrl["tipos_numerador"]) == set(TIPOS_A_HAB)
+    assert set(ctrl["tipos_comerciante_habitualista"]) == set(TIPOS_A_HAB) | {
+        "TRANSFERENCIA NACIONAL  DE COM. HAB. C/PEDIDO"}
+    assert [(o["archivo"], o["identico"]) for o in ctrl["csv_repetidos_omitidos"]] == [
+        ("dnrpa-transferencias-autos-202601.csv", True)]
     assert ctrl["numerador_subconjunto_denominador"]
     r = pd.read_csv(out / "habitualistas_cordoba_resumen.csv")
     per = r[r.periodo == "Período completo"].iloc[0]
